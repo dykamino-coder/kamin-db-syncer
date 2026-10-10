@@ -1,0 +1,143 @@
+# kamin-db-syncer: Deployment with built-in scheduler, worker pool and web UI.
+# Several replicas share the job queue in MongoDB: each job (database) runs on exactly one pod at a time.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kamin-db-syncer
+---
+# Example only — create real values with kubectl / sealed-secrets / external-secrets, never commit them.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kamin-db-syncer-secrets
+  namespace: kamin-db-syncer
+type: Opaque
+stringData:
+  MONGO_URI: "mongodb://kamin-db-syncer:CHANGE_ME@mongo.mongo.svc:27017/?authSource=admin"
+  UI_PASSWORD: "CHANGE_ME"
+  # encrypts per-job git keys entered in the UI (AES-256-GCM); changing it invalidates stored keys
+  SECRET_KEY: "CHANGE_ME_LONG_RANDOM"
+  # SQL logins: "credential": "prod-reader" -> CRED_PROD_READER_USER / CRED_PROD_READER_PASSWORD
+  CRED_PROD_READER_USER: "sync_reader"
+  CRED_PROD_READER_PASSWORD: "CHANGE_ME"
+  CRED_COPY_WRITER_USER: "sync_writer"
+  CRED_COPY_WRITER_PASSWORD: "CHANGE_ME"
+  # optional default git credentials (jobs can set their own repo + key in the UI)
+  GIT_TOKEN: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kamin-db-syncer-config
+  namespace: kamin-db-syncer
+data:
+  # optional: jobs created on first start (SYNC_CONFIG_MODE=seed) — afterwards edit them in the UI
+  config.json: |
+    {
+      "jobs": [
+        {
+          "name": "proddb",
+          "source": { "server": "sql-prod.example.local,1433", "database": "ProdDb", "credential": "prod-reader" },
+          "target": { "server": "sql-copy.example.local,1433", "database": "ProdDb_Copy", "credential": "copy-writer" },
+          "git":    { "enabled": true, "repoUrl": "https://git.example.local/dba/proddb-schema.git", "branch": "main" },
+          "schema": { "publish": true },
+          "data":   { "tables": ["*"], "mode": "diff" }
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kamin-db-syncer
+  namespace: kamin-db-syncer
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: kamin-db-syncer }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  template:
+    metadata:
+      labels: { app: kamin-db-syncer }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      # a running sync is cancelled on SIGTERM and recorded; interrupted reloads resume next run
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: kamin-db-syncer
+          image: registry.example.local/kamin-db-syncer:2.0.0
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            - { name: SYNC_SCHEDULE, value: "*/10 * * * *" }   # default for jobs without their own cron
+            - { name: SYNC_TIMEZONE, value: "Europe/Moscow" }
+            - { name: MAX_PARALLEL, value: "2" }               # jobs (databases) per pod at the same time
+            - { name: SCAN_MAXDOP, value: "1" }                # cores one hashing scan may use on SQL Server
+            - { name: BATCH_TARGET_SECONDS, value: "2" }       # adaptive batches aim at this per statement
+            - { name: SYNC_CONFIG_FILE, value: /config/config.json }
+            - { name: SYNC_CONFIG_MODE, value: seed }
+            - { name: RUN_RETENTION_DAYS, value: "30" }
+            - { name: GIT_REPO_URL, value: "" }                # default repo if a job has none
+            - { name: GIT_BRANCH, value: main }
+            - { name: GIT_AUTHOR_NAME, value: kamin-db-syncer }
+            - { name: GIT_AUTHOR_EMAIL, value: kamin-db-syncer@example.local }
+            - { name: UI_USER, value: admin }
+            - { name: TRUST_SERVER_CERT, value: "true" }
+          envFrom:
+            - secretRef: { name: kamin-db-syncer-secrets }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            # idle ~5 MB; SqlPackage (schema extract/publish) is the peak, ~150-400 MB on big schemas
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: work, mountPath: /work }      # temp files + per-job git clone cache
+            - { name: config, mountPath: /config, readOnly: true }
+      volumes:
+        - name: work
+          emptyDir: { sizeLimit: 5Gi }
+        - name: config
+          configMap: { name: kamin-db-syncer-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kamin-db-syncer
+  namespace: kamin-db-syncer
+spec:
+  selector: { app: kamin-db-syncer }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kamin-db-syncer
+  namespace: kamin-db-syncer
+spec:
+  rules:
+    - host: kamin-db-syncer.example.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: kamin-db-syncer, port: { name: http } }
